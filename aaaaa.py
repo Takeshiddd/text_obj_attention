@@ -1,70 +1,92 @@
+## coding: UTF-8
 import torch
-from torch import nn
-import numpy as np
+import random
+
+class  OneHotTransform(object):
+    def __init__(self, num_character):
+        self.num_character =  num_character
+    def __call__(self, tensor):
+        one_hot = torch.eye(self.num_character)[tensor.long()]
+        return one_hot
 
 
-class TestModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(3, 8, kernel_size=1)
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=1)
-        self.conv3 = nn.Conv2d(16, 32, kernel_size=1)
+class Dataset(torch.utils.data.Dataset):
+    def __init__(self, data_size, transform):
+        self.data_size = data_size
+        self.transform = transform
+        self.x = self.generate_number()
+        self.y = self.generate_number()
+        self.z = self.x - self.y
+        self.char2id = {str(i) : i for i in range(10)}
+        self.char2id.update({" ":10, "-":11, "_":12})
 
-    def forward(self, x):
-        x1 = self.conv1(x)
-        x2 = self.conv2(nn.AvgPool2d(2)(x1))
-        x3 = self.conv3(nn.AvgPool2d(2)(x2))
-        return [x1, x2, x3] # listで返しているので
+        self.inputs = []
+        self.targets = []
+        for i in range(self.data_size):
+            x_y_ = str(self.x[i].item()) + "-" + str(self.y[i].item())
+            z_ = "_" + str(self.z[i].item())
+            x_y_ = "{: <7}".format(x_y_)
+            z_ = "{: <5s}".format(z_)
 
-def main():
-    model = TestModel()
-    input = torch.randn(4, 3, 16, 16) # batch_size=4, channel=3, x=y=16
-    out = model(input) # 出力はtorch.Tensorのlist
-    print(type(out))
-    for x in out:
-        print(x.size(), type(x))
+            input = [self.char2id[x_y_item] for x_y_item in x_y_]
+            target = [self.char2id[z_item] for z_item in z_]
 
-if __name__ == "__main__":
-    # # main()
-    # mat1 = torch.cat([torch.arange(2*3).reshape((1, 2, 3)), torch.arange(2*3).reshape((1, 2, 3))*2])
-    # mat2 = torch.cat([torch.ones(2*3).reshape((1, 3, 2)), torch.ones(2*3).reshape((1, 3, 2))*2])
-    # torch.mm(mat1, mat2)
-    # torch.tensor([[ 0.4851,  0.5037, -0.3633],
-    #               [-0.0760, -3.6705,  2.4784]])
+            self.inputs.append(input)
+            self.targets.append(target)
 
-    a = torch.zeros(3, 2, 5, 6)
-    b = torch.zeros(3, 2, 5, 6)
-    a[1,:,3,4] = torch.tensor([0, 1])
-    a[1,:,2,5] = torch.tensor([-np.sqrt(3), 1])
-    b[1,:,1,3] = torch.tensor([1, 0])
-    b[1,:,1,5] = torch.tensor([1, np.sqrt(3)])
-
-
-    batch_size, channel_size, h, w = a.size()
-    a_disamb = a.permute(0,2,3,1).view(batch_size, -1, channel_size)
-    norm = torch.norm(a_disamb, dim=2).unsqueeze(-1)
-    norm[norm == 0] = 1
-    a_disamb = a_disamb / norm  # Don't set the operator as /= in order not to change original data of image feature.
+        self.inputs = torch.Tensor(self.inputs)
+        self.targets = torch.Tensor(self.targets)
+        
+    def __len__(self):
+        return self.data_size
     
-    b_disamb = b.permute(0,2,3,1).view(batch_size, -1, channel_size)
-    norm = torch.norm(b_disamb, dim=2).unsqueeze(-1)
-    norm[norm == 0] = 1
-    b_disamb = b_disamb / norm  # Don't set the operator as /= in order not to change original data of image feature.
-    ab = torch.bmm(a_disamb, b_disamb.permute(0,2,1))
+    def __getitem__(self, idx):
+        input = self.transform(self.inputs[idx])
+        target = self.transform(self.targets[idx])
+        print(idx)
+        return input, target
+        
+    def generate_number(self):
+        data = [random.randint(0, 999) for _ in range(self.data_size)]
+        return torch.tensor(data)
+        
 
-    weight = ab.view(batch_size,h,w,h,w)
-    # weighted = weight.unsqueeze(3) * b.unsqueeze(1).unsqueeze(1)
-    # a += weighted.sum(dim=(4,5)).permute(0,3,1,2)
+def func_kwargs(**kwargs):
+    print('kwargs: ', kwargs)
+    print('type: ', type(kwargs))
+    if not kwargs:
+        print('none')
+
+# DATA_SIZE = 50000
+# NUM_CHARACTER = 13
+
+# transform = OneHotTransform(num_character=NUM_CHARACTER)
+# dataset = Dataset(DATA_SIZE, transform)
+# dataloader = torch.utils.data.DataLoader(dataset, batch_size=2, shuffle=True)
 
 
-    weighted_b = weight.unsqueeze(-1) * b.permute(0,2,3,1).unsqueeze(1).unsqueeze(1)
-    mixed = a + weighted_b.sum(dim=(3,4)).permute(0,3,1,2)
-    
-    from ssd import Attn
 
-    attn = Attn(weight_activation=None)
-    mixed2, weight2 = attn.attn_func(a, b)
-    
-    
-    print()
-    
+import matplotlib.pyplot as plt
+
+for i, c in enumerate(plt.get_cmap("tab10")):
+    print(i)
+
+
+# import pandas as pd
+# import numpy as np
+
+# def func(df):
+#     df_= pd.DataFrame(np.random.rand((2, 8)), 
+#                    index=[0, 1], columns=['x0', 'y0', 'x1', 'y1', 'x2', 'y2', 'x3', 'y3'])
+#     df['E'] = pd.Series([1,1], index=['SIX', 'SEVEN'])
+#     return df
+
+
+
+# df = pd.DataFrame(np.random.rand(16).reshape((2, 8)), 
+#                    index=[0, 1], columns=['x0', 'y0', 'x1', 'y1', 'x2', 'y2', 'x3', 'y3'])
+
+            
+# print()
+
+

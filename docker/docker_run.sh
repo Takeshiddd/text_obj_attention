@@ -1,0 +1,2 @@
+#!/bin/sh
+docker run -v $(pwd):/home/kouki -v /media/kouki/kouki/COCOtext:/media/kouki/kouki/COCOtext  -v /media/kouki/kouki/scene_text_data:/media/kouki/kouki/scene_text_data --gpus all -p 8097:8097 -it ssd:latest /bin/bash

@@ -103,9 +103,10 @@ def match(threshold, truths, priors, variances, labels, loc_t, conf_t, idx):
     # TODO refactor: index  best_prior_idx with long tensor
     # ensure every gt matches with its prior of max overlap
     for j in range(best_prior_idx.size(0)):
-        best_truth_idx[best_prior_idx[j]] = j
-    matches = truths[best_truth_idx]          # Shape: [num_priors,4]
-    conf = labels[best_truth_idx] + 1         # Shape: [num_priors]
+        best_truth_idx[best_prior_idx[j]] = j # avoid duplicating matched boxes of top [num truth]
+    matches = truths[best_truth_idx]          # Shape: [num_priors,4]　The true bboxes matched to priors
+    conf = labels[best_truth_idx]             # Shape: [num_priors]    The true classes of the bboxes matched to priors
+    assert 0 not in conf, 'class id error!'
     conf[best_truth_overlap < threshold] = 0  # label as background
     loc = encode(matches, priors, variances)
     loc_t[idx] = loc    # [num_priors,4] encoded offsets to learn
@@ -123,9 +124,12 @@ def encode(matched, priors, variances):
         variances: (list[float]) Variances of priorboxes
     Return:
         encoded boxes (tensor), Shape: [num_priors, 4]
+        *encoded boxes: the bbox data transformed to the 
+        distances of centers of each ground truth and matched 
+        prior
     """
 
-    # dist b/t match center and prior's center
+    # distance b/t match center and prior's center
     g_cxcy = (matched[:, :2] + matched[:, 2:])/2 - priors[:, :2]
     # encode variance
     g_cxcy /= (variances[0] * priors[:, 2:])
@@ -135,7 +139,7 @@ def encode(matched, priors, variances):
     eps = 1e-10 # added by Takeshita (2019/11/5)
     g_wh = torch.log(g_wh + eps) / variances[1] # added by Takeshita (2019/11/5) reffering https://github.com/amdegroot/ssd.pytorch/issues/162
     # return target for smooth_l1_loss
-    return torch.cat([g_cxcy, g_wh], 1)  # [num_priors,4]
+    return torch.cat([g_cxcy, g_wh], 1)  # [num_priors,4] 
 
 
 # Adapted from https://github.com/Hakuyume/chainer-ssd

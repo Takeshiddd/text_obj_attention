@@ -1,10 +1,12 @@
 import torch
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 from layers import *
-from data import voc, coco
+from data import voc, coco, openimages
 import os
+import re
+import numpy as np
 from gensim.models import word2vec
 
 
@@ -28,15 +30,25 @@ class SSD(nn.Module):
         head: "multibox head" consists of loc and conf conv layers
     """
 
-    def __init__(self, phase, size, base, extras, head, num_classes, wv_model, attn_blocks_index=[], map_classes=False):
+    def __init__(self, phase, size, base, extras, head, num_classes, 
+            attn_blocks_index=[], weight_func='cos_sim', class_vectors=None, 
+            weight_activation='relu', word_cnn=None, dataset='COCO'):
         super(SSD, self).__init__()
         self.phase = phase
         self.num_classes = num_classes
-        self.cfg = (coco, voc)[num_classes == 21]
+        if dataset=='COCO': 
+            self.cfg = coco 
+        elif dataset=='VOC':
+            self.cfg = voc
+        elif dataset=='OpenImages':
+            self.cfg = openimages  
+        else:
+            print('invalid dataset')
+            raise ValueError
         self.priorbox = PriorBox(self.cfg)
         # self.priors = Variable(self.priorbox.forward(), volatile=True)
         with torch.no_grad():
-            self.priors = Variable(self.priorbox.forward())
+            self.priors = torch.tensor(self.priorbox.forward())
         self.size = size
 
         # SSD network
@@ -44,19 +56,24 @@ class SSD(nn.Module):
         # Layer learns to scale the l2 normalized features from conv4_3
         self.L2Norm = L2Norm(512, 20)
         self.extras = nn.ModuleList(extras)
-
         self.loc = nn.ModuleList(head[0])
         self.conf = nn.ModuleList(head[1])
 
+        self.class_vectors = class_vectors
         if phase == 'test':
             self.softmax = nn.Softmax(dim=-1)
-            self.detect = Detect(num_classes, 0, 200, 0.01, 0.45)
-        self.attn_blocks_index = attn_blocks_index
-        self.map_classes = map_classes
-        if map_classes or len(self.attn_blocks_index) != 0:
-            self.wv_model = word2vec.Word2Vec.load(wv_model)
+            num_classes = self.num_classes if self.class_vectors is None else self.class_vectors.shape[0]
+            self.detect = Detect(num_classes, 0, 200, 0.01, 0.45,
+                                        class_vectors=self.class_vectors)
 
-    def forward(self, x):
+        self.attn_blocks_index = sorted(attn_blocks_index)
+        self.word_cnn = word_cnn
+
+        self.attn_blocks = []
+        for _ in self.attn_blocks_index:
+            self.attn_blocks.append(Attn(weight_func, weight_activation))
+
+    def forward(self, x, word_emb_img):
         """Applies network layers and ops on input image(s) x.
 
         Args:
@@ -75,13 +92,31 @@ class SSD(nn.Module):
                     2: localization layers, Shape: [batch,num_priors*4]
                     3: priorbox layers, Shape: [2,num_priors*4]
         """
+        if self.attn_blocks_index:
+            values = self.word_cnn(word_emb_img)
+            
         sources = list()
         loc = list()
         conf = list()
+        weights = list()
 
         # apply vgg up to conv4_3 relu
         for k in range(23):
             x = self.vgg[k](x)
+            # aply attention 
+            if k == 15 and 0 in self.attn_blocks_index:
+                idx = self.attn_blocks_index.index(0)
+                attn_block = self.attn_blocks[idx]
+                value = values[idx]
+                x, weight = attn_block.attn_func(x, value)
+                weights.append(weight)
+
+            if k == 22 and 1 in self.attn_blocks_index:
+                idx = self.attn_blocks_index.index(1)
+                attn_block = self.attn_blocks[idx]
+                value = values[idx]
+                x, weight = attn_block.attn_func(x, value)
+                weights.append(weight)
 
         s = self.L2Norm(x)
         sources.append(s)
@@ -89,6 +124,14 @@ class SSD(nn.Module):
         # apply vgg up to fc7
         for k in range(23, len(self.vgg)):
             x = self.vgg[k](x)
+            # aply attention
+            if k == 29 and 2 in self.attn_blocks_index:
+                idx = self.attn_blocks_index.index(2)
+                attn_block = self.attn_blocks[idx]
+                value = values[idx]
+                x, weight = attn_block.attn_func(x, value)
+                weights.append(weight)
+
         sources.append(x)
 
         # apply extra layers and cache source layer outputs
@@ -107,8 +150,7 @@ class SSD(nn.Module):
         if self.phase == "test":
             output = self.detect(
                 loc.view(loc.size(0), -1, 4),                   # loc preds
-                self.softmax(conf.view(conf.size(0), -1,
-                             self.num_classes)),                # conf preds
+                conf.view(conf.size(0), -1, self.num_classes),                # conf preds
                 self.priors.type(type(x.data)))
         else:
             output = (
@@ -116,21 +158,35 @@ class SSD(nn.Module):
                 conf.view(conf.size(0), -1, self.num_classes),
                 self.priors
             )
-        return output
+        return output, weights
 
     def load_weights(self, base_file):
-        other, ext = os.path.splitext(base_file)
+        _, ext = os.path.splitext(base_file)
         if ext == '.pkl' or '.pth':
             print('Loading weights into state dict...')
-            self.load_state_dict(torch.load(base_file,
-                                 map_location=lambda storage, loc: storage))
+            self.load_state_dict(fix_model_state_dict(torch.load(base_file,
+                                 map_location=lambda storage, loc: storage)))
             print('Finished!')
         else:
             print('Sorry only .pth and .pkl files supported.')
 
+    def load_pretrained_weights(self, base_file):
+        _, ext = os.path.splitext(base_file)
+        if ext == '.pkl' or '.pth':
+            print('Loading weights into state dict...')
+            state_dict = fix_model_state_dict(torch.load(base_file,
+                                 map_location=lambda storage, loc: storage))
+            for key in list(state_dict.keys()):
+                if key.split('.')[0] == 'conf':
+                    del state_dict[key]
+            self.load_state_dict(state_dict, strict=False)
+            print('Finished!')
+        else:
+            print('Sorry only .pth and .pkl files supported.')
 
 class WordCNN(nn.Module):
     def __init__(self, base_cfg, image_size=300, wv_dim=200, attn_blocks_index=[]):
+        super(WordCNN, self).__init__()
         self.image_size = image_size
         self.wv_dim = wv_dim 
         self.attn_blocks_index = sorted(attn_blocks_index)
@@ -142,29 +198,28 @@ class WordCNN(nn.Module):
                       get_pooling_layer(base_cfg[2]),
                       nn.Conv2d(self.wv_dim, self.wv_dim, kernel_size=3, padding=1),
                       nn.Conv2d(self.wv_dim, self.wv_dim, kernel_size=3, padding=1),
-                      get_pooling_layer(base_cfg[4]),
+                      get_pooling_layer(base_cfg[5]),
                       nn.Conv2d(self.wv_dim, base_cfg[6], kernel_size=3, padding=1),
                       nn.Conv2d(base_cfg[6], base_cfg[7], kernel_size=3, padding=1),
                       nn.Conv2d(base_cfg[7], base_cfg[8], kernel_size=3, padding=1)]
-            block0 = nn.ModuleList([block0])
-            self.attn_blocks.append(block0)
+            self.block0 = nn.ModuleList(block0)
+            self.attn_blocks.append(self.block0)
 
-        
         if max(self.attn_blocks_index) >= 1:
             block1 = [get_pooling_layer(base_cfg[9]),
                       nn.Conv2d(base_cfg[8], base_cfg[10], kernel_size=3, padding=1),
                       nn.Conv2d(base_cfg[10], base_cfg[11], kernel_size=3, padding=1),
                       nn.Conv2d(base_cfg[11], base_cfg[12], kernel_size=3, padding=1)]
-            block1 = nn.ModuleList([block1])
-            self.attn_blocks.append(block1)
+            self.block1 = nn.ModuleList(block1)
+            self.attn_blocks.append(self.block1)
         
         if max(self.attn_blocks_index) >= 2:
             block2 = [get_pooling_layer(base_cfg[13]),
                       nn.Conv2d(base_cfg[12], base_cfg[14], kernel_size=3, padding=1),
                       nn.Conv2d(base_cfg[14], base_cfg[15], kernel_size=3, padding=1),
                       nn.Conv2d(base_cfg[15], base_cfg[16], kernel_size=3, padding=1)]
-            block2 = nn.ModuleList([block2])
-            self.attn_blocks.append(block2)
+            self.block2 = nn.ModuleList(block2)
+            self.attn_blocks.append(self.block2)
         
         if max(self.attn_blocks_index) >= 3:
             print('max attn_layer number should be set 2 or less')
@@ -173,7 +228,8 @@ class WordCNN(nn.Module):
     def forward(self, x):
         values = []
         for i, block in enumerate(self.attn_blocks):
-            x = block(x)
+            for b in block:
+                x = b(x)
             if i in self.attn_blocks_index:
                 values.append(x)
         return values
@@ -190,33 +246,34 @@ class Attn(object):
         if not self.weight_activation:
             self._weight_activation = lambda x: x
         elif self.weight_activation == 'relu':
-            self._weight_activation = nn.ReLU()
+            self._weight_activation = nn.ReLU(inplace=True)
 
     def attn_func(self, image_feature, word_feature):
         weights = self._weight_function(image_feature, word_feature)
         weighted_word_feature = weights.unsqueeze(3) * word_feature.unsqueeze(1).unsqueeze(1)
         mixed_feature = image_feature + weighted_word_feature.sum(dim=(4,5)).permute(0,3,1,2)
-        return mixed_feature, weights
+        return mixed_feature.contiguous(), weights
 
     def _weight_function(self, image_feature, word_feature):
         batch_size, channel_size, height, width = image_feature.size()
+        _, _, height_w, width_w = word_feature.size()
         image_feature_disamb = image_feature.permute(0,2,3,1).view(batch_size, -1, channel_size)
         word_feature_disamb = word_feature.permute(0,2,3,1).view(batch_size, -1, channel_size)
         
         if self.weight_func == 'cos_sim':
             norm = torch.norm(image_feature_disamb, dim=2).unsqueeze(-1)
-            norm[norm == 0] = 1
+            # norm[norm == 0] = 1
             image_feature_disamb = image_feature_disamb / norm  # Don't set the operator as /= in order not to change original data of image feature.
             norm = torch.norm(word_feature_disamb, dim=2).unsqueeze(-1) #
-            norm[norm == 0] = 1
+            # norm[norm == 0] = 1
             word_feature_disamb = word_feature_disamb / norm  # Don't set the operator as /= in order not to change original data of image feature.
 
         mat_prod = torch.bmm(image_feature_disamb, word_feature_disamb.permute(0,2,1))
 
-        weights = mat_prod.view(batch_size, height, width, height, width)
+        weights = mat_prod.view(batch_size, height, width, height_w, width_w)
         weights = self._weight_activation(weights)
-        
         return weights
+    
 
 
 def get_pooling_layer(v):
@@ -228,7 +285,15 @@ def get_pooling_layer(v):
 
 ############################################ maked by takeshita ############################################
 #############################################################################################################
-
+def fix_model_state_dict(state_dict):
+    from collections import OrderedDict
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k
+        if name.startswith('module.'):
+            name = name[7:]  # remove 'module.' of dataparallel
+        new_state_dict[name] = v
+    return new_state_dict
 
 # This function is derived from torchvision VGG make_layers()
 # https://github.com/pytorch/vision/blob/master/torchvision/models/vgg.py
@@ -303,8 +368,44 @@ mbox = {
     '512': [],
 }
 
+def get_class_vec(classes, wv_model, bg_vector='cartesian', norm_vec=True):
+    class_vec = class_vec_(classes, wv_model, norm_vec)
+    if bg_vector == 'zero':
+        bg = np.zeros(wv_model.vector_size)
+    elif bg_vector == 'cartesian':
+        eig_val, eig_vec = get_carte_prod_(class_vec)
+        print('maximum eiginvalue: {:.6e}'.format(eig_val[0]))
+        print('minimum eiginvalue: {:.6e}'.format(eig_val[-1]))
+        bg = eig_vec[:, -1].astype(np.float64)
+    else:
+        raise ValueError
+    if norm_vec:
+        norm = np.linalg.norm(bg)
+        if norm == 0:
+            norm = 1
+        bg = bg / norm
+    class_vectors = torch.tensor([bg] + class_vec, 
+        requires_grad=False)
+    return class_vectors.float()
 
-def build_ssd(phase, wv_model, size=300, num_classes=21, attn_blocks_index=[], map_classes=False):
+def class_vec_(classes, wv_model, norm_vec=True):
+    class_list = [re.split('[- ]', name) for name in classes]
+    vec_list = []
+    for classes in class_list:
+        vec = np.array([wv_model[word.lower()] for word in classes]).sum(0)
+        if norm_vec:
+            vec = vec / np.linalg.norm(vec)
+        vec_list.append(vec)
+    return vec_list
+
+def get_carte_prod_(class_vec):
+    class_vec = np.array(class_vec)  # (num_classes, vec_dim)
+    class_vec_t = class_vec.transpose()
+    sigma = np.dot(class_vec_t, class_vec)
+    return np.linalg.eig(sigma)
+
+def build_ssd(phase, size, num_classes, classes, wv_model=None, attn_blocks_index=[],
+              dataset='COCO', map_classes=False, use_cuda=False):
     if phase != "test" and phase != "train":
         print("ERROR: Phase: " + phase + " not recognized")
         return
@@ -315,4 +416,18 @@ def build_ssd(phase, wv_model, size=300, num_classes=21, attn_blocks_index=[], m
     base_, extras_, head_ = multibox(vgg(base[str(size)], 3, attn_blocks_index=attn_blocks_index),
                                      add_extras(extras[str(size)], 1024),
                                      mbox[str(size)], num_classes)
-    return SSD(phase, size, base_, extras_, head_, num_classes, wv_model)
+    if attn_blocks_index:
+        word_cnn = WordCNN(base[str(size)], size, wv_model.vector_size, attn_blocks_index)
+    else:
+        word_cnn = None
+    
+    if map_classes:
+        class_vectors = get_class_vec(classes, wv_model)
+        if use_cuda: 
+            class_vectors = class_vectors.to(device)
+    else:
+        class_vectors = None
+        
+    return SSD(phase, size, base_, extras_, head_, num_classes, 
+            attn_blocks_index=attn_blocks_index, word_cnn=word_cnn,
+            dataset=dataset, class_vectors=class_vectors)
