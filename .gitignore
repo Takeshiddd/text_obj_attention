@@ -2,3 +2,6 @@ trained_model*/
 weights_contenue*/
 *.png
 *.jpg
+.DS_Store
+__pycache__
+.vscode
